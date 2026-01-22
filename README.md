@@ -23,7 +23,41 @@ Sistema integral para la gestión de proyectos de tesis, dictámenes y seguimien
 - **Base de Datos:** MySQL 8.0+ o MariaDB 10.4+.
 - **Frontend:** Bootstrap 5, Bootstrap Icons.
 
-### ⚙️ Configuración del Servidor (Importante)
+## 📦 Instalación
+
+### 1. Clonar el Repositorio
+```bash
+git clone https://github.com/fcjpunap/NADIA.git
+cd NADIA
+```
+
+### 2. Importar la Base de Datos
+```bash
+mysql -u root -p < nadia.sql
+```
+
+### 3. Configurar Credenciales
+Edita el archivo `app/config/config.php` y reemplaza los valores de ejemplo:
+
+```php
+define('DB_HOST', 'localhost');
+define('DB_USER', 'tu_usuario_db');      // ⚠️ Cambiar por tu usuario real
+define('DB_PASS', 'tu_password_db');     // ⚠️ Cambiar por tu contraseña real
+define('DB_NAME', 'nadia');
+```
+
+**Nota:** Si tu instalación no está en la ruta `/sespecialidad/nadia/gemini/public/`, también debes ajustar:
+```php
+define('URL_BASE', '/tu_ruta_personalizada/');
+```
+
+### 4. Configurar Permisos
+```bash
+chmod -R 755 public/
+chmod -R 777 public/uploads/
+```
+
+### ⚙️ Configuración del Servidor Apache (Importante)
 El sistema utiliza URLs amigables (ej: `/auth/login`) que requieren la reescritura de URLs en Apache.
 1. Habilitar el módulo rewrite: `sudo a2enmod rewrite`
 2. Configurar el VirtualHost o `apache2.conf` para permitir la lectura del archivo `.htaccess`:
