@@ -51,6 +51,15 @@ define('DB_NAME', 'nadia');
 define('URL_BASE', '/tu_ruta_personalizada/');
 ```
 
+Y editar el archivo `public/.htaccess` para cambiar la línea:
+```apache
+RewriteBase /sespecialidad/nadia/gemini/public/
+```
+Por tu ruta personalizada:
+```apache
+RewriteBase /tu_ruta_personalizada/
+```
+
 ### 4. Configurar Permisos
 ```bash
 chmod -R 755 public/
