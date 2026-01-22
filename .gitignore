@@ -1,0 +1,19 @@
+# Carpeta de subidas (no subir archivos de tesistas)
+public/uploads/*
+
+# Ignorar scripts de diagnóstico y parches temporales de la raíz
+diag_*.php
+check_*.php
+debug_*.sh
+deploy_*.sh
+diagnostico_*.sh
+force_*.sh
+*.bak
+*.bak_*
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Permitir el archivo SQL si es parte del repositorio
+# !nadia.sql

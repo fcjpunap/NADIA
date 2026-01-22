@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <title>Revisión</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <style>
+        body {
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: #333;
+        }
+        #toolbar {
+            background: #212529;
+            color: white;
+            padding: 8px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #444;
+        }
+        #main-area {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        #pdf-container {
+            flex: 7;
+            background: #525659;
+            overflow-y: auto;
+            text-align: center;
+            position: relative;
+        }
+        #side-panel {
+            flex: 3;
+            background: #f8f9fa;
+            display: flex;
+            flex-direction: column;
+            border-left: 1px solid #ccc;
+            min-width: 300px;
+        }
+        /* Pestañas Manuales */
+        .custom-tabs {
+            display: flex;
+            background: #e9ecef;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .c-tab {
+            flex: 1;
+            padding: 10px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-weight: bold;
+            color: #6c757d;
+            border-bottom: 3px solid transparent;
+        }
+        .c-tab:hover {
+            background: #e2e6ea;
+        }
+        .c-tab.active {
+            color: #0d6efd;
+            border-bottom: 3px solid #0d6efd;
+            background: white;
+        }
+        .tab-content-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            display: none;
+        }
+        .tab-content-area.active {
+            display: block;
+        }
+        canvas {
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+            margin: 20px auto;
+            max-width: 95%;
+        }
+        .blocked {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        
+        .obs-old {
+            border-left: 4px solid #6c757d !important;
+            background-color: #e9ecef !important;
+            opacity: 0.8;
+        }
+        .obs-new {
+            border-left: 4px solid #0d6efd !important;
+            background-color: #fff !important;
+        }
+        
+        /* Animación para resaltar botones */
+        @keyframes pulse-border {
+            0% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(255, 193, 7, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0); }
+        }
+        .highlight-action {
+            animation: pulse-border 1.5s infinite;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <div class="d-flex align-items-center gap-3">
+            <a href="<?php echo URL_BASE; ?>docente/dashboard" class="btn btn-outline-light btn-sm"><i
+                    class="bi bi-arrow-left"></i> Volver</a>
+            <span class="badge bg-warning text-dark"><?php echo $data['fase_lbl']; ?></span>
+            <small class="d-none d-md-block text-truncate"
+                style="max-width: 300px;"><?php echo $data['proyecto']['titulo']; ?></small>
+        </div>
+        <div>
+            <button class="btn btn-sm btn-secondary" onclick="changePage(-1)">Anterior</button>
+            <span class="mx-2">Pág <input type="number" id="pn" value="1"
+                    style="width:40px; text-align:center; border-radius:3px; border:none;" onchange="jump()"></span>
+            <button class="btn btn-sm btn-secondary" onclick="changePage(1)">Siguiente</button>
+        </div>
+        <div>
+            <?php if (!$data['bloqueado']): ?>
+                <div class="d-flex gap-2 align-items-center">
+                    <span class="text-warning small me-2"><i class="bi bi-info-circle"></i> Dictamen:</span>
+                    <form action="<?php echo URL_BASE; ?>docente/guardar_dictamen_final" method="POST" class="d-flex gap-1"
+                        id="formDictamen">
+                        <input type="hidden" name="id_proyecto" value="<?php echo $data['proyecto']['id']; ?>">
+                        <input type="hidden" name="etapa_actual" value="<?php echo $data['fase_lbl']; ?>">
+                        <button name="resultado" value="Desaprobado" class="btn btn-danger btn-sm"
+                            onclick="return confirm('¿Confirma que desea DESAPROBAR este expediente? Esto cerrará el proceso.')">Desaprobar</button>
+                        <?php if ($data['fase_lbl'] == 'Sustentacion'): ?>
+                            <button name="resultado" value="Aprobado" class="btn btn-success btn-sm"
+                                onclick="return confirm('¿Confirma APROBAR la sustentación?')">Aprobado</button>
+                            <button name="resultado" value="Aprobado con distinción"
+                                class="btn btn-warning btn-sm text-dark fw-bold"
+                                onclick="return confirm('¿Confirma APROBAR CON DISTINCIÓN?')">Distinción</button>
+                        <?php else: ?>
+                            <button name="resultado" value="Observado" class="btn btn-warning btn-sm"
+                                onclick="return confirm('¿Confirma enviar el proyecto como OBSERVADO? El tesista deberá corregir.')">Observar</button>
+                            <button name="resultado" value="Aprobado" class="btn btn-success btn-sm"
+                                onclick="return confirm('¿Confirma APROBAR el proyecto? Pasará a la siguiente etapa.')">Aprobar</button>
+                        <?php endif; ?>
+                    </form>
+                </div>
+            <?php else: ?>
+                <span class="badge bg-success p-2">Voto Emitido</span>
+            <?php endif; ?>
+        </div>
+    </div>
+    <div id="main-area">
+        <div id="pdf-container">
+            <?php if (!$data['documento']): ?>
+                <div class="alert alert-warning mt-5 mx-5">
+                    <h5>Documento no disponible</h5>
+                    <p>El tesista no ha subido el archivo PDF correspondiente a esta fase
+                        (<?php echo $data['fase_lbl']; ?>).</p>
+                    <p>Revise la pestaña "Expediente" para ver otros archivos.</p>
+                </div>
+            <?php else: ?>
+                <canvas id="the-canvas"></canvas>
+            <?php endif; ?>
+        </div>
+        <div id="side-panel">
+            <div class="custom-tabs">
+                <button class="c-tab active" onclick="switchTab('obs')" id="btn-obs">Observaciones</button>
+                <button class="c-tab" onclick="switchTab('exp')" id="btn-exp">Expediente</button>
+            </div>
+            <div id="content-obs" class="tab-content-area active">
+                <div class="d-flex justify-content-between align-items-center mb-2 border-bottom pb-2">
+                    <strong>Página <span id="pg-title">1</span></strong>
+                    <button class="btn btn-sm btn-light" onclick="loadC(document.getElementById('pn').value)">↻</button>
+                </div>
+                <div id="list" style="flex:1; overflow-y:auto; min-height: 200px;">Cargando...</div>
+                <?php if (!$data['bloqueado']): ?>
+                    <div class="mt-3 pt-2 border-top">
+                        <textarea id="txt" class="form-control mb-2" rows="3" <?php echo $data['obs_finalizadas'] ? 'disabled' : ''; ?>
+                            placeholder="Escriba su observación aquí..."></textarea>
+                        <button id="btn-save-obs" <?php echo $data['obs_finalizadas'] ? 'disabled' : ''; ?> class="btn btn-primary w-100 btn-sm" onclick="save()">Registrar
+                            Observación</button>
+                        
+                        <!-- FIX V37: Botón Finalizar con lógica de bloqueo -->
+                        <button class="btn btn-outline-success w-100 btn-sm mt-2"
+                            onclick="finalizarObs()" style="<?php echo $data['obs_finalizadas'] ? 'display:none;' : ''; ?>">Finalizar Observaciones</button>
+                        <?php if($data['obs_finalizadas']): ?>
+                        <div class="alert alert-success mt-3">
+                            <strong><i class="bi bi-check-circle"></i> Observaciones Finalizadas</strong><br>
+                            Los jurados, asesor y tesista deben reunirse para el dictamen final del <?php echo strtolower($data['fase_lbl']); ?>.
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+            </div>
+            <div id="content-exp" class="tab-content-area">
+                <h6 class="text-muted border-bottom pb-1 mb-2">Documentos</h6>
+                <ul class="list-group list-group-flush small mb-3">
+                    <?php foreach ($data['all_docs'] as $d): ?>
+                        <li class="list-group-item px-0 d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="fw-bold"><?php echo $d['tipo_documento']; ?></div>
+                                <div class="text-muted" style="font-size:0.85em">
+                                    <?php echo date('d/m/Y', strtotime($d['created_at'])); ?>
+                                </div>
+                            </div>
+                            <a href="<?php echo URL_BASE . $d['ruta_archivo']; ?>" target="_blank"
+                                class="btn btn-sm btn-outline-dark">Ver</a>
+                        </li>
+                    <?php endforeach; ?>
+                </ul>
+                <h6 class="text-muted border-bottom pb-1 mb-2">Actas Generadas</h6>
+                <div class="d-grid gap-2 mb-3">
+                    <?php if ($data['actas']['p']): ?>
+                        <a href="<?php echo URL_BASE; ?>reportes/acta_imprimible?id=<?php echo $data['proyecto']['id']; ?>&tipo=proyecto"
+                            target="_blank" class="btn btn-success btn-sm text-start">📄 Acta Aprob. Proyecto</a>
+                    <?php endif; ?>
+                    <?php if ($data['actas']['b']): ?>
+                        <a href="<?php echo URL_BASE; ?>reportes/acta_imprimible?id=<?php echo $data['proyecto']['id']; ?>&tipo=borrador"
+                            target="_blank" class="btn btn-success btn-sm text-start">📄 Acta Aprob. Borrador</a>
+                    <?php endif; ?>
+                    <?php if (isset($data['actas']['s']) && $data['actas']['s']): ?>
+                        <a href="<?php echo URL_BASE; ?>reportes/acta_imprimible?id=<?php echo $data['proyecto']['id']; ?>&tipo=sustentacion"
+                            target="_blank" class="btn btn-success btn-sm text-start">📄 Acta Sustentación</a>
+                    <?php endif; ?>
+                </div>
+                <h6 class="text-muted border-bottom pb-1 mb-2">Historial Reciente</h6>
+                <ul class="list-group list-group-flush small">
+                    <?php foreach ($data['historial'] as $h): ?>
+                        <li class="list-group-item px-0 text-muted py-1">
+                            <strong><?php echo $h['accion']; ?></strong>: <?php echo substr($h['detalle'], 0, 50); ?>...
+                        </li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        </div>
+    </div>
+    <script>
+        const url = '<?php echo ($data['documento']) ? URL_BASE . $data['documento']['ruta_archivo'] : ''; ?>';
+        const pid = <?php echo $data['proyecto']['id']; ?>;
+        const obsFinalizadas = <?php echo $data['obs_finalizadas'] ? 'true' : 'false'; ?>;
+        // FIX V37: Función para finalizar observaciones con bloqueo y mensaje
+        async function finalizarObs() {
+            if(!confirm('¿Confirma que ha terminado de registrar sus observaciones?')) return;
+            
+            // Guardar en servidor
+            try {
+                const r = await fetch('<?php echo URL_BASE; ?>docente/api_finalizar_observaciones', {
+                    method: 'POST',
+                    body: JSON.stringify({ id_proyecto: pid })
+                });
+                const data = await r.json();
+                
+                if (data.status !== 'ok') {
+                    alert('Error al finalizar observaciones');
+                    return;
+                }
+            } catch(e) {
+                alert('Error de conexión');
+                return;
+            }
+            
+            // 1. Deshabilitar campos
+            document.getElementById('txt').disabled = true;
+            document.getElementById('btn-save-obs').disabled = true;
+            
+            // 2. Ocultar botón
+            const btn = document.querySelector('button[onclick="finalizarObs()"]');
+            if(btn) btn.style.display = 'none';
+            
+            // 3. Mostrar mensaje
+            const container = document.querySelector('.mt-3.pt-2.border-top');
+            const msg = document.createElement('div');
+            msg.className = 'alert alert-success mt-2 small';
+            msg.innerHTML = '<strong><i class="bi bi-check-circle"></i> Observaciones Finalizadas.</strong><br>Sus observaciones han sido guardadas correctamente.';
+            container.appendChild(msg);
+            
+            // 4. Recargar después de 2 segundos
+            setTimeout(() => location.reload(), 2000);
+        }
+        // LÓGICA PESTAÑAS MANUAL
+        function switchTab(tab) {
+            document.getElementById('content-obs').classList.remove('active');
+            document.getElementById('content-exp').classList.remove('active');
+            document.getElementById('btn-obs').classList.remove('active');
+            document.getElementById('btn-exp').classList.remove('active');
+            document.getElementById('content-' + tab).classList.add('active');
+            document.getElementById('btn-' + tab).classList.add('active');
+        }
+        // PDF LÓGICA
+        let pdf = null, pn = 1, scale = 1.5, cvs = document.getElementById('the-canvas'), ctx = cvs ? cvs.getContext('2d') : null;
+        if (typeof pdfjsLib !== 'undefined') pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+        function render(n) {
+            if (!pdf) return;
+            pdf.getPage(n).then(p => {
+                var v = p.getViewport({ scale: scale });
+                cvs.height = v.height; cvs.width = v.width;
+                p.render({ canvasContext: ctx, viewport: v });
+            });
+            document.getElementById('pg-title').innerText = n;
+            document.getElementById('pn').value = n;
+            loadC(n);
+        }
+        function changePage(o) { if (pdf && pn + o >= 1 && pn + o <= pdf.numPages) { pn += o; render(pn); } }
+        function jump() { var n = parseInt(document.getElementById('pn').value); if (pdf && n >= 1 && n <= pdf.numPages) { pn = n; render(n); } }
+        async function loadC(n) {
+            const l = document.getElementById('list'); l.innerHTML = '<div class="text-muted text-center mt-3">Cargando...</div>';
+            try {
+                const r = await fetch('<?php echo URL_BASE; ?>docente/api_get_comentarios', { method: 'POST', body: JSON.stringify({ id_proyecto: pid, pagina: n }) });
+                const d = await r.json(); l.innerHTML = '';
+                if (d.length === 0) l.innerHTML = '<div class="text-muted text-center mt-3 small">Sin observaciones.</div>';
+                d.forEach(c => {
+                    let btns = '';
+                    const isOld = c.es_antiguo == 1;
+                    const badge = isOld ? '<span class="badge bg-secondary mb-1">Versión Anterior</span>' : '<span class="badge bg-primary mb-1">Versión Actual</span>';
+                    const cls = isOld ? 'obs-old' : 'obs-new';
+                    if (c.id_jurado == <?php echo $_SESSION['user_id']; ?> && !<?php echo $data['bloqueado'] ? 1 : 0; ?>) {
+                        btns = `<div class="mt-1 text-end">
+                            <button class="btn btn-xs btn-link p-0 text-primary" onclick="editObs(${c.id}, '${c.observacion_texto.replace(/'/g, "\\'")}')">Editar</button>
+                            <button class="btn btn-xs btn-link p-0 text-danger ms-2" onclick="deleteObs(${c.id})">Borrar</button>
+                        </div>`;
+                    }
+                    l.innerHTML += `<div class="alert alert-secondary p-2 small mb-2 ${cls}">
+                                        ${badge}<br>
+                                        <strong>${c.nombres}</strong>:<br>
+                                        <span id="obs-txt-${c.id}">${c.observacion_texto}</span>
+                                        ${btns}
+                                    </div>`;
+                });
+            } catch (e) { l.innerHTML = 'Error al cargar.'; }
+        }
+        async function save() {
+            const t = document.getElementById('txt').value; if (!t) return;
+            const oid = document.getElementById('txt').getAttribute('data-edit-id');
+            const url = oid ? '<?php echo URL_BASE; ?>docente/api_update_comentario' : '<?php echo URL_BASE; ?>docente/api_save_comentario';
+            const body = oid ? { id: oid, texto: t } : { id_proyecto: pid, pagina: pn, texto: t };
+            try {
+                const r = await fetch(url, { method: 'POST', body: JSON.stringify(body) });
+                const d = await r.json();
+                if (d.status == 'ok') {
+                    document.getElementById('txt').value = '';
+                    document.getElementById('txt').removeAttribute('data-edit-id');
+                    document.getElementById('btn-save-obs').innerText = 'Registrar Observación';
+                    loadC(pn);
+                } else { alert('Error al guardar'); }
+            } catch (e) { }
+        }
+        async function deleteObs(id) {
+            if (!confirm('¿Eliminar esta observación?')) return;
+            try {
+                await fetch('<?php echo URL_BASE; ?>docente/api_delete_comentario', { method: 'POST', body: JSON.stringify({ id: id }) });
+                loadC(pn);
+            } catch (e) { }
+        }
+        function editObs(id, text) {
+            const txt = document.getElementById('txt');
+            txt.value = text;
+            txt.setAttribute('data-edit-id', id);
+            document.getElementById('btn-save-obs').innerText = 'Actualizar Observación';
+            txt.focus();
+        }
+        if (url) pdfjsLib.getDocument(url).promise.then(p => { pdf = p; render(1); });
+    </script>
+</body>
+</html>

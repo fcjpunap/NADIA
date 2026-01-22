@@ -1,0 +1,824 @@
+<?php
+require_once '../app/core/Controller.php';
+require_once '../app/core/Database.php';
+require_once APP_ROOT . '/helpers/PlazoHelper.php';
+require_once APP_ROOT . '/helpers/Paginator.php';
+require_once APP_ROOT . '/helpers/Mailer.php';
+
+class AdminController extends Controller
+{
+    private $db;
+    private $es_coordinador = false;
+    private $mi_facultad = '';
+    private $mi_id_facultad = null;
+    public function __construct()
+    {
+        // REDIRECCIÓN PÚBLICA INTELIGENTE
+        if ((session_status() === PHP_SESSION_NONE ? session_start() : true) && !isset($_SESSION["user_id"])) {
+            if (isset($_SERVER["REQUEST_URI"]) && stripos($_SERVER["REQUEST_URI"], "imprimir_constancia") !== false) {
+                $id = $_GET["id"] ?? 0;
+                $cvd = $_GET["cvd"] ?? "";
+                header("Location: " . URL_BASE . "verificacion/constancia?id=$id&cvd=$cvd");
+                exit;
+            }
+        }
+        if (session_status() === PHP_SESSION_NONE)
+            session_start();
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: ' . URL_BASE . 'auth/login');
+            exit;
+        }
+        $this->db = (new Database())->connect();
+        if ($_SESSION['rol'] == 4) {
+            $this->es_coordinador = true;
+            $this->mi_facultad = $_SESSION['facultad'];
+            $stmt = $this->db->prepare("SELECT id_facultad FROM usuarios WHERE id = ?");
+            $stmt->execute([$_SESSION['user_id']]);
+            $this->mi_id_facultad = $stmt->fetchColumn();
+        }
+    }
+    private function getUiData()
+    {
+        return ['rol_label' => ($this->es_coordinador) ? 'Coordinador' : 'Admin', 'scope_label' => ($this->es_coordinador) ? $this->mi_facultad : 'Global', 'theme_color' => ($this->es_coordinador) ? 'primary' : 'danger', 'icon' => ($this->es_coordinador) ? 'bi-building' : 'bi-globe'];
+    }
+
+    private function filtrar($sql, $col_texto = 'facultad', $col_id = 'id_facultad')
+    {
+        if ($this->es_coordinador) {
+            $condiciones = [];
+            if ($this->mi_id_facultad && $col_id) {
+                $condiciones[] = "$col_id = {$this->mi_id_facultad}";
+            }
+            $term = str_replace("Facultad de ", "", $this->mi_facultad);
+            $term = trim($term);
+            if (!empty($term)) {
+                $condiciones[] = "$col_texto LIKE '%$term%'";
+            }
+            if (!empty($condiciones)) {
+                $filtro_final = "(" . implode(" OR ", $condiciones) . ")";
+                return (strpos($sql, 'WHERE') !== false) ? "$sql AND $filtro_final" : "$sql WHERE $filtro_final";
+            }
+        }
+        return $sql;
+    }
+
+    public function ver_proyecto()
+    {
+        $id = $_GET['id'];
+        $sql = "SELECT p.*, p.updated_at, 
+              CONCAT(IFNULL(t.nombres,''), ' ', IFNULL(t.apellidos,'')) as t_completo, 
+              CONCAT(IFNULL(a.nombres,''), ' ', IFNULL(a.apellidos,'')) as a_completo,
+              t.nombres as t_nom, t.apellidos as t_ape, a.nombres as a_nom, a.apellidos as a_ape,
+              CONCAT(COALESCE(ar.nombre,''),' > ',COALESCE(li.nombre,''),' > ',COALESCE(su.nombre,'')) as linea_completa,
+              li.nombre as nombre_linea, su.nombre as nombre_sublinea
+              FROM proyectos p 
+              LEFT JOIN usuarios t ON p.id_tesista=t.id 
+              LEFT JOIN usuarios a ON p.id_asesor=a.id 
+              LEFT JOIN sublineas_investigacion su ON p.id_linea_investigacion=su.id 
+              LEFT JOIN lineas_investigacion_v2 li ON su.id_linea=li.id 
+              LEFT JOIN areas_investigacion ar ON li.id_area=ar.id 
+              WHERE p.id=?";
+        $p = $this->db->prepare($sql);
+        $p->execute([$id]);
+        $py = $p->fetch(PDO::FETCH_ASSOC);
+
+        $d = $this->db->prepare("SELECT * FROM documentos WHERE id_proyecto=? ORDER BY created_at DESC");
+        $d->execute([$id]);
+        $docs_proy = $d->fetchAll(PDO::FETCH_ASSOC);
+
+        $etapa = ($py['id_etapa_actual'] >= 3) ? 'Sustentacion' : (($py['id_etapa_actual'] == 2) ? 'Borrador' : 'Proyecto');
+        $sqlJ = "SELECT ja.id_jurado, ja.rol_jurado, 
+               CONCAT(IFNULL(u.nombres,'User'), ' ', IFNULL(u.apellidos,'Removed')) as nombre_completo, 
+               u.nombres, u.apellidos,
+               (SELECT resultado FROM dictamenes d WHERE d.id_proyecto=ja.id_proyecto AND d.id_jurado=ja.id_jurado AND d.etapa='$etapa' ORDER BY d.id DESC LIMIT 1) as resultado 
+               FROM jurado_asignaciones ja 
+               LEFT JOIN usuarios u ON ja.id_jurado=u.id 
+               WHERE ja.id_proyecto=?
+               ORDER BY CASE ja.rol_jurado WHEN 'Presidente' THEN 1 WHEN 'Primer miembro' THEN 2 WHEN 'Segundo miembro' THEN 3 ELSE 4 END";
+        $j = $this->db->prepare($sqlJ);
+        $j->execute([$id]);
+        $jurados = $j->fetchAll(PDO::FETCH_ASSOC);
+
+        $h = $this->db->prepare("SELECT * FROM historial_movimientos WHERE id_proyecto=? ORDER BY fecha DESC");
+        $h->execute([$id]);
+
+        $v_proy = $this->db->query("SELECT COUNT(*) FROM dictamenes WHERE id_proyecto=$id AND etapa='Proyecto' AND resultado='Aprobado'")->fetchColumn();
+        $v_borr = $this->db->query("SELECT COUNT(*) FROM dictamenes WHERE id_proyecto=$id AND etapa='Borrador' AND resultado='Aprobado'")->fetchColumn();
+
+        $acta_proy = ($py['id_etapa_actual'] >= 2 || $v_proy >= 2);
+        $acta_borr = ($py['id_etapa_actual'] >= 3 || $v_borr >= 2);
+
+        $votos_sust = $this->db->query("SELECT COUNT(*) FROM dictamenes WHERE id_proyecto=$id AND etapa='Sustentacion'")->fetchColumn();
+        $acta_sust = ($votos_sust >= 3);
+
+        // REVISIÓN DE REQUISITOS PARA PROGRAMACIÓN
+        $tiene_req_sust = false;
+        foreach ($docs_proy as $doc) {
+            if (stripos($doc['tipo_documento'], 'Requisitos') !== false && stripos($doc['tipo_documento'], 'Sustentacion') !== false) {
+                $tiene_req_sust = true;
+                break;
+            }
+        }
+
+        $puede_programar = ($py['id_etapa_actual'] >= 2 && ($tiene_req_sust || in_array($py['estado'], ['Aprobado', 'En Sustentación', 'Sustentado'])));
+
+        $plazo = PlazoHelper::calcular($py, $this->db);
+        $allDoc = $this->db->query("SELECT id,nombres,apellidos FROM usuarios WHERE id_rol_principal=2")->fetchAll();
+
+        $this->view('admin/proyectos/detalle', ['proyecto' => $py, 'documentos' => $docs_proy, 'jurados' => $jurados, 'historial' => $h->fetchAll(PDO::FETCH_ASSOC), 'acta_proy' => $acta_proy, 'acta_borr' => $acta_borr, 'acta_sust' => $acta_sust, 'puede_programar' => $puede_programar, 'plazo' => $plazo, 'all_docentes' => $allDoc, 'ui' => $this->getUiData()]);
+    }
+
+    public function editar_proyecto()
+    {
+        $id = $_GET['id'];
+        if ($_POST) {
+            $st = explode('|', $_POST['estado_fase']);
+            $fn = $_POST['facultad'];
+            if (isset($_POST['id_facultad'])) {
+                $s = $this->db->prepare("SELECT nombre FROM facultades WHERE id=?");
+                $s->execute([$_POST['id_facultad']]);
+                $fn = $s->fetchColumn();
+            }
+            $pn = $_POST['programa'];
+            if (isset($_POST['id_programa'])) {
+                $s = $this->db->prepare("SELECT nombre FROM programas WHERE id=?");
+                $s->execute([$_POST['id_programa']]);
+                $pn = $s->fetchColumn();
+            }
+
+            $this->db->prepare("UPDATE proyectos SET titulo=?,facultad=?,programa=?,id_facultad=?,id_programa=?,nivel_academico=?,estado=?,id_etapa_actual=?,id_asesor=?,id_linea_investigacion=? WHERE id=?")
+                ->execute([$_POST['titulo'], $fn, $pn, $_POST['id_facultad'], $_POST['id_programa'], $_POST['nivel'], $st[0], $st[1], $_POST['id_asesor'], $_POST['id_sublinea'], $id]);
+            header('Location: ' . URL_BASE . 'admin/proyectos?msg=updated');
+            exit;
+        }
+        $p = $this->db->query("SELECT * FROM proyectos WHERE id=$id")->fetch(PDO::FETCH_ASSOC);
+        $f = $this->db->query("SELECT * FROM facultades")->fetchAll();
+        $d = $this->db->query("SELECT id,nombres,apellidos FROM usuarios WHERE id_rol_principal=2")->fetchAll();
+
+        $progs = [];
+        if ($p['id_facultad']) {
+            $progs = $this->db->query("SELECT * FROM programas WHERE id_facultad=" . $p['id_facultad'])->fetchAll();
+        } elseif (!empty($p['facultad'])) {
+            // FIX V83: Fallback por nombre de facultad
+            $facName = trim($p['facultad']);
+            $stmt = $this->db->prepare("SELECT id FROM facultades WHERE nombre LIKE ?");
+            $stmt->execute(["%$facName%"]);
+            $foundId = $stmt->fetchColumn();
+            if ($foundId) {
+                // Actualizamos el objeto proyecto en memoria para que la vista lo seleccione
+                $p['id_facultad'] = $foundId;
+                $progs = $this->db->query("SELECT * FROM programas WHERE id_facultad=" . $foundId)->fetchAll();
+            }
+        }
+
+        require_once '../app/models/Jerarquia.php';
+        $j = new Jerarquia();
+        $jerarquia = $j->obtenerArbol();
+
+        $this->view('admin/proyectos/editar', ['proyecto' => $p, 'docentes' => $d, 'facultades' => $f, 'programas' => $progs, 'jerarquia' => $jerarquia, 'ui' => $this->getUiData()]);
+    }
+
+    public function editar_docente()
+    {
+        $id = $_GET['id'];
+        if ($_POST) {
+            $_POST['facultad'] = ($this->es_coordinador) ? $this->mi_facultad : $_POST['facultad_input'];
+            if (isset($_POST['facultad_input']))
+                $_POST['id_facultad'] = $_POST['facultad_input'];
+            $this->model('Usuario')->actualizar_full($id, $_POST);
+            header('Location: ' . URL_BASE . 'admin/docentes');
+        }
+        $u = $this->model('Usuario')->obtener($id);
+        $e = $this->model('Usuario')->obtenerExpertise($id);
+        $f = $this->db->query("SELECT * FROM facultades")->fetchAll();
+        $arbol = [];
+        if (file_exists('../app/models/Jerarquia.php')) {
+            require_once '../app/models/Jerarquia.php';
+            $j = new Jerarquia();
+            $arbol = $j->obtenerArbol();
+        }
+        $this->view('admin/docentes/editar', ['usuario' => $u, 'expertise' => $e, 'arbol' => $arbol, 'facultades' => $f, 'ui' => $this->getUiData()]);
+    }
+    public function dashboard()
+    {
+        $anio = $_GET['anio'] ?? date('Y');
+        $mes = $_GET['mes'] ?? '';
+        $sP = "SELECT COUNT(*) as t FROM proyectos WHERE YEAR(created_at) = '$anio'";
+        $sB = "SELECT COUNT(*) as t FROM proyectos WHERE id_etapa_actual>=2 AND YEAR(created_at) = '$anio'";
+        $sS = "SELECT COUNT(*) as t FROM proyectos WHERE id_etapa_actual>=3 AND YEAR(created_at) = '$anio'";
+        if ($mes) {
+            $sP .= " AND MONTH(created_at) = '$mes'";
+            $sB .= " AND MONTH(created_at) = '$mes'";
+            $sS .= " AND MONTH(created_at) = '$mes'";
+        }
+        $sU = "SELECT COUNT(*) as t FROM usuarios";
+        $sJ = "SELECT COUNT(*) as t FROM usuarios WHERE id_rol_principal=2";
+        $sT = "SELECT COUNT(*) as t FROM usuarios WHERE id_rol_principal=1";
+        if ($this->es_coordinador) {
+            $fid = $this->mi_id_facultad;
+            $ftxt = $this->mi_facultad;
+            $condP = ($fid) ? " AND id_facultad=$fid" : " AND facultad='$ftxt'";
+            $sP .= $condP;
+            $sB .= $condP;
+            $sS .= $condP;
+            $condU = ($fid) ? " WHERE id_facultad=$fid" : " WHERE facultad_asignada='$ftxt'"; $condJ = ($fid) ? " AND id_facultad=$fid" : " AND facultad_asignada='$ftxt'";
+            $sU .= $condU;
+            $sJ .= $condJ;
+            $condT = ($fid) ? " AND id_facultad=$fid" : " AND facultad_asignada='$ftxt'";
+            $sT = "SELECT COUNT(*) as t FROM usuarios WHERE id_rol_principal=1" . $condT;
+        }
+        $p = $this->db->query($sP)->fetch()['t'];
+        $u = $this->db->query($sU)->fetch()['t'];
+        $j = $this->db->query($sJ)->fetch()['t'];
+        $b = $this->db->query($sB)->fetch()['t'];
+        $t = $this->db->query($sT)->fetch()['t'];
+        $s = $this->db->query($sS)->fetch()['t'];
+        $total_base = ($p > 0) ? $p : 1;
+        $perc_borradores = round(($b / $total_base) * 100, 1);
+        $perc_sustentados = round(($s / $total_base) * 100, 1);
+        $sqlEstados = "SELECT estado, COUNT(*) as total FROM proyectos WHERE YEAR(created_at) = '$anio'";
+        if ($mes)
+            $sqlEstados .= " AND MONTH(created_at) = '$mes'";
+        if ($this->es_coordinador)
+            $sqlEstados .= ($this->mi_id_facultad) ? " AND id_facultad={$this->mi_id_facultad}" : " AND facultad='{$this->mi_facultad}'";
+        $sqlEstados .= " GROUP BY estado";
+        $estadosData = $this->db->query($sqlEstados)->fetchAll(PDO::FETCH_ASSOC);
+        $sqlMeses = "SELECT DATE_FORMAT(created_at, '%Y-%m') as mes_anio, COUNT(*) as total FROM proyectos WHERE YEAR(created_at) = '$anio'";
+        if ($this->es_coordinador)
+            $sqlMeses .= ($this->mi_id_facultad) ? " AND id_facultad={$this->mi_id_facultad}" : " AND facultad='{$this->mi_facultad}'";
+        $sqlMeses .= " GROUP BY mes_anio ORDER BY mes_anio ASC";
+        $proyectosMes = $this->db->query($sqlMeses)->fetchAll(PDO::FETCH_ASSOC);
+        $sqlSust = "SELECT DATE_FORMAT(fecha_sustentacion, '%Y-%m') as mes_anio, COUNT(*) as total FROM proyectos WHERE fecha_sustentacion IS NOT NULL AND YEAR(fecha_sustentacion) = '$anio'";
+        if ($this->es_coordinador)
+            $sqlSust .= ($this->mi_id_facultad) ? " AND id_facultad={$this->mi_id_facultad}" : " AND facultad='{$this->mi_facultad}'";
+        $sqlSust .= " GROUP BY mes_anio ORDER BY mes_anio ASC";
+        $sustentacionesMes = $this->db->query($sqlSust)->fetchAll(PDO::FETCH_ASSOC);
+        $anios = $this->db->query("SELECT DISTINCT YEAR(created_at) as anio FROM proyectos ORDER BY anio DESC")->fetchAll(PDO::FETCH_COLUMN);
+        if (empty($anios))
+            $anios = [date('Y')];
+        $sqlALS = "SELECT a.nombre as area, l.nombre as linea, s.nombre as sublinea, COUNT(p.id) as total FROM proyectos p JOIN sublineas_investigacion s ON p.id_linea_investigacion=s.id JOIN lineas_investigacion_v2 l ON s.id_linea=l.id JOIN areas_investigacion a ON l.id_area=a.id";
+        $whereALS = [];
+        if ($anio)
+            $whereALS[] = "YEAR(p.created_at) = '$anio'";
+        if ($mes)
+            $whereALS[] = "MONTH(p.created_at) = '$mes'";
+        if ($this->es_coordinador)
+            $whereALS[] = ($this->mi_id_facultad) ? "p.id_facultad={$this->mi_id_facultad}" : "p.facultad='{$this->mi_facultad}'";
+        if (!empty($whereALS))
+            $sqlALS .= " WHERE " . implode(" AND ", $whereALS);
+        $sqlALS .= " GROUP BY a.id, l.id, s.id ORDER BY total DESC";
+        $alsData = $this->db->query($sqlALS)->fetchAll(PDO::FETCH_ASSOC);
+        $this->view('admin/dashboard', ['stats' => ['usuarios' => $u, 'proyectos' => $p, 'borradores' => $b, 'perc_borradores' => $perc_borradores, 'jurados_activos' => $j, 'tesistas' => $t, 'sustentaciones' => $s, 'perc_sustentados' => $perc_sustentados, 'graficos' => ['estados' => $estadosData, 'proyectos_mes' => $proyectosMes, 'sustentaciones_mes' => $sustentacionesMes, 'tematicas' => $alsData]], 'filtros' => ['anio' => $anio, 'mes' => $mes, 'anios_disponibles' => $anios], 'ui' => $this->getUiData()]);
+    }
+    public function usuarios()
+    {
+        $q = $_GET['q'] ?? '';
+        $p = $_GET['page'] ?? 1;
+        $sql = "SELECT u.*, r.nombre_rol, f.nombre as nombre_facultad FROM usuarios u LEFT JOIN roles r ON u.id_rol_principal=r.id LEFT JOIN facultades f ON u.id_facultad=f.id WHERE (u.nombres LIKE ? OR u.apellidos LIKE ?)";
+        if ($this->es_coordinador) {
+            if ($this->mi_id_facultad) {
+                $sql .= " AND u.id_facultad={$this->mi_id_facultad}";
+            } else {
+                $sql .= " AND f.nombre='{$this->mi_facultad}'";
+            }
+        }
+        $sql .= " ORDER BY u.id DESC";
+        $pg = Paginator::paginate($this->db, $sql, ["%$q%", "%$q%"], $p, 10);
+        $this->view('admin/usuarios/index', ['usuarios' => $pg['data'], 'paginacion' => $pg, 'q' => $q, 'ui' => $this->getUiData()]);
+    }
+    public function docentes()
+    {
+        $q = $_GET['q'] ?? '';
+        $p = $_GET['page'] ?? 1;
+        $sql = "SELECT u.id, u.nombres, u.apellidos, u.codigo, u.telefono, u.grado_academico, COALESCE(f.nombre, u.facultad_asignada) as facultad_asignada FROM usuarios u LEFT JOIN facultades f ON u.id_facultad = f.id WHERE u.id_rol_principal=2 AND (u.nombres LIKE ? OR u.apellidos LIKE ?)";
+        if ($this->es_coordinador) {
+            $term = trim(str_replace('Facultad de', '', $this->mi_facultad));
+            $sql .= ($this->mi_id_facultad) ? " AND (u.id_facultad={$this->mi_id_facultad} OR u.facultad_asignada LIKE '%$term%')" : " AND u.facultad_asignada LIKE '%$term%'";
+        }
+        $pg = Paginator::paginate($this->db, $sql, ["%$q%", "%$q%"], $p, 10);
+        $this->view('admin/docentes/index', ['docentes' => $pg['data'], 'paginacion' => $pg, 'q' => $q, 'ui' => $this->getUiData()]);
+    }
+    public function tesistas()
+    {
+        $q = $_GET['q'] ?? '';
+        $p = $_GET['page'] ?? 1;
+        $sql = "SELECT u.id, u.nombres, u.apellidos, u.codigo, u.dni, u.telefono, COALESCE(f.nombre, u.facultad_asignada) as facultad_asignada, (SELECT id FROM proyectos WHERE id_tesista=u.id ORDER BY created_at DESC LIMIT 1) as id_proyecto FROM usuarios u LEFT JOIN facultades f ON u.id_facultad = f.id WHERE u.id_rol_principal=1 AND (u.nombres LIKE ? OR u.apellidos LIKE ?)";
+        if ($this->es_coordinador) {
+            $term = trim(str_replace('Facultad de', '', $this->mi_facultad));
+            $sql .= ($this->mi_id_facultad) ? " AND (u.id_facultad={$this->mi_id_facultad} OR u.facultad_asignada LIKE '%$term%')" : " AND u.facultad_asignada LIKE '%$term%'";
+        }
+        $pg = Paginator::paginate($this->db, $sql, ["%$q%", "%$q%"], $p, 10);
+        $this->view('admin/tesistas/index', ['tesistas' => $pg['data'], 'paginacion' => $pg, 'q' => $q, 'ui' => $this->getUiData()]);
+    }
+    public function proyectos()
+    {
+        $q = $_GET['q'] ?? '';
+        $p = $_GET['page'] ?? 1;
+        $sql = "SELECT p.*, CONCAT(IFNULL(u.apellidos,''), ', ', IFNULL(u.nombres,'')) as tesista, COALESCE(NULLIF(p.facultad,''), f.nombre) as fac_nombre FROM proyectos p LEFT JOIN usuarios u ON p.id_tesista=u.id LEFT JOIN facultades f ON p.id_facultad=f.id WHERE (p.titulo LIKE ?)";
+        $sql = $this->filtrar($sql, 'p.facultad', 'p.id_facultad');
+        $sql .= " ORDER BY p.created_at DESC";
+        $pg = Paginator::paginate($this->db, $sql, ["%$q%"], $p, 10);
+        $this->view('admin/proyectos/index', ['proyectos' => $pg['data'], 'paginacion' => $pg, 'q' => $q, 'ui' => $this->getUiData()]);
+    }
+    public function usuarios_crear()
+    {
+        if ($_POST) {
+            $this->model('Usuario')->crear($_POST);
+            header('Location: ' . URL_BASE . 'admin/usuarios');
+        } else {
+            $f = $this->db->query("SELECT * FROM facultades")->fetchAll();
+            $a = $this->db->query("SELECT * FROM areas_investigacion")->fetchAll();
+            $this->view('admin/usuarios/crear', ['facultades' => $f, 'areas' => $a, 'ui' => $this->getUiData()]);
+        }
+    }
+            public function editar_usuario()
+    {
+        $id = $_GET["id"];
+        if ($_POST) {
+            if (isset($_POST["facultad_id"])) {
+                $s = $this->db->prepare("SELECT nombre FROM facultades WHERE id=?");
+                $s->execute([$_POST["facultad_id"]]);
+                $_POST["facultad"] = $s->fetchColumn();
+                $_POST["id_facultad"] = $_POST["facultad_id"];
+            }
+            $this->model("Usuario")->actualizar_full($id, $_POST);
+            header("Location: " . URL_BASE . "admin/usuarios");
+            exit;
+        }
+        $u = $this->model("Usuario")->obtener($id);
+        $rs = $this->db->query("SELECT * FROM roles")->fetchAll();
+        $fs = $this->db->query("SELECT * FROM facultades")->fetchAll();
+        $as = $this->db->query("SELECT * FROM areas_investigacion")->fetchAll();
+        
+        $progs = [];
+        if ($u["id_facultad"]) {
+            $progs = $this->db->query("SELECT id, nombre, nivel FROM programas WHERE id_facultad = " . $u["id_facultad"] . " ORDER BY nombre ASC")->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        $lines = [];
+        if ($u["id_area_investigacion"]) {
+            $lines = $this->db->query("SELECT id, nombre FROM lineas_investigacion_v2 WHERE id_area = " . $u["id_area_investigacion"] . " ORDER BY nombre ASC")->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        $this->view("admin/usuarios/editar", [
+            "usuario" => $u, 
+            "roles" => $rs, 
+            "facultades" => $fs, 
+            "areas" => $as, 
+            "programas" => $progs, 
+            "lineas" => $lines,
+            "ui" => $this->getUiData()
+        ]);
+    }
+    public function editar_tesista()
+    {
+        $id = $_GET['id'];
+        if ($_POST) {
+            $this->model('Usuario')->actualizar($id, $_POST);
+            header('Location: ' . URL_BASE . 'admin/tesistas');
+        }
+        $u = $this->model('Usuario')->obtener($id);
+        $this->view('admin/tesistas/editar', ['usuario' => $u, 'ui' => $this->getUiData()]);
+    }
+    public function sorteo()
+    {
+        $sql = "SELECT id,titulo,estado FROM proyectos WHERE estado NOT IN ('Aprobado','Sustentado')";
+        $sql = $this->filtrar($sql, 'facultad');
+        $p = $this->db->query($sql)->fetchAll();
+        $h = $this->db->query("SELECT ja.fecha_asignacion as fecha,p.titulo,u.nombres,u.apellidos,ja.rol_jurado FROM jurado_asignaciones ja JOIN proyectos p ON ja.id_proyecto=p.id JOIN usuarios u ON ja.id_jurado=u.id ORDER BY ja.fecha_asignacion DESC LIMIT 10")->fetchAll();
+        $this->view('admin/sorteo/index', ['proyectos' => $p, 'historial' => $h, 'ui' => $this->getUiData()]);
+    }
+    public function ejecutar_sorteo()
+    {
+        if ($_POST) {
+            $id = $_POST["id_proyecto"];
+            $proy = $this->db->query("SELECT id_linea_investigacion, id_asesor FROM proyectos WHERE id=$id")->fetch(PDO::FETCH_ASSOC);
+            $sl = $proy["id_linea_investigacion"];
+            $id_asesor = (int) $proy["id_asesor"];
+
+            $sql = "SELECT u.id, u.categoria_docente, u.antiguedad_anios 
+                    FROM usuarios u 
+                    JOIN docente_sublineas ds ON u.id=ds.id_docente 
+                    WHERE u.id_rol_principal=2 AND ds.id_sublinea=$sl 
+                    AND u.id != $id_asesor 
+                    ORDER BY CASE u.categoria_docente WHEN \"Principal\" THEN 1 WHEN \"Asociado\" THEN 2 WHEN \"Auxiliar\" THEN 3 ELSE 4 END ASC, u.antiguedad_anios DESC, RAND() LIMIT 3";
+
+            $js = $this->db->query($sql)->fetchAll();
+
+            if (count($js) < 3) {
+                $lid = $this->db->query("SELECT id_linea FROM sublineas_investigacion WHERE id=$sl")->fetchColumn();
+                $faltantes = 3 - count($js);
+                $temp_excluidos = array_column($js, "id") ?: [];
+                $temp_excluidos[] = $id_asesor;
+                $ids_excluidos = implode(",", $temp_excluidos);
+
+                $sqlFallback = "SELECT u.id FROM usuarios u 
+                                JOIN docente_sublineas ds ON u.id=ds.id_docente 
+                                JOIN sublineas_investigacion s ON ds.id_sublinea=s.id 
+                                WHERE u.id_rol_principal=2 AND s.id_linea=$lid 
+                                AND u.id NOT IN ($ids_excluidos) 
+                                ORDER BY RAND() LIMIT $faltantes";
+
+                $jsFallback = $this->db->query($sqlFallback)->fetchAll();
+                $js = array_merge($js, $jsFallback);
+            }
+
+            $this->db->exec("DELETE FROM jurado_asignaciones WHERE id_proyecto=$id");
+            $roles = ["Presidente", "Primer miembro", "Segundo miembro"];
+            foreach ($js as $k => $d) {
+                if (isset($roles[$k]))
+                    $this->db->exec("INSERT INTO jurado_asignaciones (id_proyecto,id_jurado,rol_jurado) VALUES ($id," . $d["id"] . ",\"" . $roles[$k] . "\")");
+            }
+            $this->db->exec("UPDATE proyectos SET estado=\"En Revisión\" WHERE id=$id");
+            header("Location: " . URL_BASE . "admin/sorteo?msg=ok");
+            exit;
+        }
+    }
+
+    public function docente_proyectos()
+    {
+        $id = $_GET['id'];
+        $docente = $this->model('Usuario')->obtener($id);
+        $sqlJ = "SELECT p.*, ja.rol_jurado, ja.fecha_asignacion, t.nombres as t_nom, t.apellidos as t_ape FROM jurado_asignaciones ja JOIN proyectos p ON ja.id_proyecto=p.id LEFT JOIN usuarios t ON p.id_tesista=t.id WHERE ja.id_jurado=$id ORDER BY p.created_at DESC";
+        $como_jurado = $this->db->query($sqlJ)->fetchAll(PDO::FETCH_ASSOC);
+        $sqlA = "SELECT p.*, 'Asesor' as rol_jurado, p.created_at as fecha_asignacion, t.nombres as t_nom, t.apellidos as t_ape FROM proyectos p LEFT JOIN usuarios t ON p.id_tesista=t.id WHERE p.id_asesor=$id ORDER BY p.created_at DESC";
+        $como_asesor = $this->db->query($sqlA)->fetchAll(PDO::FETCH_ASSOC);
+        $this->view('admin/docentes/proyectos', ['docente' => $docente, 'jurado' => $como_jurado, 'asesor' => $como_asesor, 'ui' => $this->getUiData()]);
+    }
+    public function config()
+    {
+        $c = $this->model('Configuracion');
+        $arbol = [];
+        if (file_exists('../app/models/Jerarquia.php')) {
+            require_once '../app/models/Jerarquia.php';
+            $j = new Jerarquia();
+            $arbol = $j->obtenerArbol();
+        }
+        $this->view('admin/config/index', ['configs' => $c->obtenerTodo(), 'arbol' => $arbol, 'ui' => $this->getUiData()]);
+    }
+    public function guardar_config()
+    {
+        if ($_POST) {
+            foreach ($_POST as $k => $v)
+                $this->model('Configuracion')->actualizar($k, $v);
+            header('Location: ' . URL_BASE . 'admin/config');
+        }
+    }
+    public function agregar_nodo()
+    {
+        if ($_POST) {
+            require_once '../app/models/Jerarquia.php';
+            (new Jerarquia())->crearArea($_POST['nombre']);
+            header('Location: ' . URL_BASE . 'admin/config');
+        }
+    }
+    public function eliminar_nodo()
+    {
+        if (isset($_GET['id'])) {
+            require_once '../app/models/Jerarquia.php';
+            (new Jerarquia())->eliminarEntidad($_GET['tipo'], $_GET['id']);
+            header('Location: ' . URL_BASE . 'admin/config');
+        }
+    }
+    public function plantillas()
+    {
+        if (isset($_GET['edit'])) {
+            $p = $this->db->query("SELECT * FROM plantillas WHERE id=" . $_GET['edit'])->fetch();
+            $this->view('admin/config/plantilla_editar', ['plantilla' => $p, 'ui' => $this->getUiData()]);
+        } else {
+            $a = $this->db->query("SELECT * FROM plantillas")->fetchAll();
+            $this->view('admin/config/plantillas', ['plantillas' => $a, 'ui' => $this->getUiData()]);
+        }
+    }
+    public function guardar_plantilla()
+    {
+        if ($_POST) {
+            $this->db->prepare("UPDATE plantillas SET contenido=?,asunto=? WHERE id=?")->execute([$_POST['contenido'], $_POST['asunto'] ?? '', $_POST['id']]);
+            header('Location: ' . URL_BASE . 'admin/plantillas');
+        }
+    }
+    public function config_email()
+    {
+        if ($_POST) {
+            $active = isset($_POST['smtp_active']) ? 1 : 0;
+            $server = $_POST['smtp_server'] ?? '';
+            $port = $_POST['smtp_port'] ?? 25;
+            $user = $_POST['smtp_user'] ?? '';
+            $pass = $_POST['smtp_pass'] ?? '';
+            $secure = $_POST['smtp_secure'] ?? 'ssl';
+            $s_email = $_POST['sender_email'] ?? '';
+            $s_name = $_POST['sender_name'] ?? 'Sistema NADIA';
+            $sql = "UPDATE config_email SET 
+                    smtp_active=?, smtp_server=?, smtp_port=?, smtp_user=?, smtp_pass=?, smtp_secure=?, sender_email=?, sender_name=? 
+                    WHERE id=1";
+            $stmt = $this->db->prepare($sql);
+            $stmt->execute([$active, $server, $port, $user, $pass, $secure, $s_email, $s_name]);
+            header('Location: ' . URL_BASE . 'admin/config_email?msg=Configuración guardada correctamente');
+            exit;
+        } else {
+            $conf = $this->db->query("SELECT * FROM config_email WHERE id=1")->fetch(PDO::FETCH_ASSOC);
+            if (!$conf)
+                $conf = []; // Evitar null
+            $this->view('admin/config/email', ['conf' => $conf, 'ui' => $this->getUiData()]);
+        }
+    }
+    public function cambiar_jurado()
+    {
+        if ($_POST) {
+            $this->db->prepare("UPDATE jurado_asignaciones SET id_jurado=? WHERE id_proyecto=? AND id_jurado=?")->execute([$_POST['id_jurado_nuevo'], $_POST['id_proyecto'], $_POST['id_jurado_antiguo']]);
+            header('Location: ' . URL_BASE . 'admin/ver_proyecto?id=' . $_POST['id_proyecto']);
+        }
+    }
+
+    public function generar_acta()
+    {
+        $id_proyecto = (int) ($_GET["id"] ?? 0);
+        $tipo_acta = $_GET["tipo"] ?? "Acta Proyecto"; // Acta Proyecto, Acta Borrador, Acta Sustentacion
+
+        // 1. Obtener Proyecto con todos sus datos y participantes
+        $sql = "SELECT p.*, f.nombre as fac_nombre, pr.nombre as prg_nombre,
+                CONCAT(u1.apellidos, ', ', u1.nombres) as tesista_1,
+                CONCAT(u2.apellidos, ', ', u2.nombres) as tesista_2,
+                CONCAT(ua.apellidos, ', ', ua.nombres) as asesor_nombre
+                FROM proyectos p
+                LEFT JOIN facultades f ON p.id_facultad = f.id
+                LEFT JOIN programas pr ON p.id_programa = pr.id
+                LEFT JOIN usuarios u1 ON p.id_tesista = u1.id
+                LEFT JOIN usuarios u2 ON p.id_tesista_2 = u2.id
+                LEFT JOIN usuarios ua ON p.id_asesor = ua.id
+                WHERE p.id = $id_proyecto";
+        $proyecto = $this->db->query($sql)->fetch(PDO::FETCH_ASSOC);
+        if (!$proyecto)
+            die("Proyecto no encontrado.");
+        // 2. Obtener Jurados
+        $sqlJ = "SELECT u.apellidos, u.nombres, ja.rol_jurado 
+                 FROM jurado_asignaciones ja 
+                 JOIN usuarios u ON ja.id_jurado = u.id 
+                 WHERE ja.id_proyecto = $id_proyecto";
+        $jurados = $this->db->query($sqlJ)->fetchAll(PDO::FETCH_ASSOC);
+        $jMap = [];
+        foreach ($jurados as $j) {
+            $nom = $j["apellidos"] . ", " . $j["nombres"];
+            if ($j["rol_jurado"] == "Presidente")
+                $jMap["[presidente]"] = $nom;
+            if ($j["rol_jurado"] == "Primer miembro")
+                $jMap["[primer_miembro]"] = $nom;
+            if ($j["rol_jurado"] == "Segundo miembro")
+                $jMap["[segundo_miembro]"] = $nom;
+        }
+        // 3. Cargar Plantilla
+        $stmtP = $this->db->prepare("SELECT contenido FROM plantillas WHERE tipo = ? OR nombre LIKE ? LIMIT 1");
+        $stmtP->execute([$tipo_acta, "%$tipo_acta%"]);
+        $plantilla = $stmtP->fetchColumn();
+        if (!$plantilla)
+            $plantilla = "<h2>$tipo_acta</h2><p>Contenido base para [titulo].</p>";
+        // 4. Reemplazar Variables Dinámicas
+
+
+
+        $mesesLista = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+        $fUnix = strtotime($fecha_para_acta ?? date("Y-m-d"));
+        $fechaRealTexto = date("d", $fUnix) . " de " . $mesesLista[date("n", $fUnix) - 1] . " de " . date("Y", $fUnix);
+
+        // Variables de Sustentación
+        $mesesSust = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+        $fSustRaw = $proyecto["fecha_sustentacion"] ?? null;
+        $fSustTexto = "por programar";
+        if ($fSustRaw && $fSustRaw != "0000-00-00") {
+            $ts = strtotime($fSustRaw);
+            $fSustTexto = date("d", $ts) . " de " . $mesesSust[date("n", $ts) - 1] . " de " . date("Y", $ts);
+        }
+        $hSustTexto = (!empty($proyecto["hora_sustentacion"]) && $proyecto["hora_sustentacion"] != "00:00:00") ? $proyecto["hora_sustentacion"] : "por programar";
+        $lSustTexto = (!empty(trim($proyecto["lugar_sustentacion"] ?? ""))) ? $proyecto["lugar_sustentacion"] : "por programar";
+        $vars = [
+            "[institucion]" => $this->db->query("SELECT valor FROM configuraciones WHERE clave='nombre_institucion' LIMIT 1")->fetchColumn() ?: "UNIVERSIDAD NACIONAL DEL ALTIPLANO",
+            "[facultad]" => $proyecto["fac_nombre"],
+            "[programa]" => $proyecto["prog_nombre"],
+            "[titulo]" => $proyecto["titulo"],
+            "[tesista]" => $proyecto["tesista_1"],
+            "[cotesista]" => $proyecto["tesista_2"] ?? "",
+            "[asesor]" => $proyecto["asesor_nombre"],
+            "[resultado]" => $proyecto["estado"],
+
+
+
+            "[fecha]" => $fechaRealTexto,
+            "[fecha_sustentacion]" => $fSustTexto,
+            "[hora_sustentacion]" => $hSustTexto,
+            "[lugar_sustentacion]" => $lSustTexto,
+            "[presidente]" => $jMap["[presidente]"] ?? "Por asignar",
+            "[primer_miembro]" => $jMap["[primer_miembro]"] ?? "Por asignar",
+            "[segundo_miembro]" => $jMap["[segundo_miembro]"] ?? "Por asignar"
+        ];
+        $contenido_final = str_replace(array_keys($vars), array_values($vars), $plantilla);
+        // 5. Gestionar CVD para el Acta (Persistente)
+        $tipo_cvd = "ACTA_" . strtoupper(str_replace(" ", "_", $tipo_acta));
+        $stmtCvd = $this->db->prepare("SELECT cvd FROM constancias_emitidas WHERE id_usuario = ? AND fecha_emision > DATE_SUB(NOW(), INTERVAL 1 HOUR) LIMIT 1"); // Evitar duplicados rápidos
+        // Usamos id_usuario como el id del proyecto para simplificar la tabla de verificacion o id_docente=0
+        // Mejor: Guardamos en constancias_emitidas pero con id_usuario negativo o un flag
+        $cvd_key = "PROY_" . $id_proyecto . "_" . $tipo_acta;
+        $stmtCvd = $this->db->prepare("SELECT cvd FROM constancias_emitidas WHERE id_usuario = ? ORDER BY id DESC LIMIT 1");
+        // Reutilizamos el campo id_usuario para guardar el ID del proyecto si es Acta
+        // Pero para no romper, usaremos un hash único basado en el proyecto
+        $cvd = strtoupper(substr(md5($cvd_key), 0, 16));
+
+        // Verificar si existe en DB
+        $check = $this->db->prepare("SELECT id FROM constancias_emitidas WHERE cvd = ?");
+        $check->execute([$cvd]);
+        if (!$check->fetch()) {
+            $this->db->prepare("INSERT INTO constancias_emitidas (id_usuario, cvd) VALUES (?, ?)")->execute([-$id_proyecto, $cvd]);
+        }
+        $protocol = isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] === "on" ? "https" : "http";
+        $url_verif = "$protocol://" . $_SERVER["HTTP_HOST"] . URL_BASE . "verificacion/acta?id=$id_proyecto&cvd=$cvd&tipo=" . urlencode($tipo_acta);
+        $this->view("admin/actas/imprimir", [
+            "proyecto" => $proyecto,
+            "contenido" => $contenido_final,
+            "cvd" => $cvd,
+            "url_verificacion" => $url_verif,
+            "ui" => $this->getUiData()
+        ]);
+    }
+
+    public function borradores()
+    {
+        $this->view('admin/borradores/index', ['ui' => $this->getUiData()]);
+    }
+    public function logs()
+    {
+        $this->view('admin/logs', ['ui' => $this->getUiData()]);
+    }
+    public function estadisticas()
+    {
+        $this->view('admin/estadisticas/index', ['estados' => [], 'programas' => [], 'ui' => $this->getUiData()]);
+    }
+    public function eliminar_proyecto()
+    {
+        if (isset($_GET['id']) && isset($_GET['motivo'])) {
+            $id = $_GET['id'];
+            $motivo = $_GET['motivo'];
+            $uid = $_SESSION['user_id'];
+            $p = $this->db->query("SELECT titulo FROM proyectos WHERE id=$id")->fetchColumn();
+            $this->db->prepare("INSERT INTO logs_sistema (accion, detalle, id_usuario) VALUES ('ELIMINAR_PROYECTO', ?, ?)")->execute(["Proyecto ID: $id ($p). Motivo: $motivo", $uid]);
+            $this->db->exec("DELETE FROM jurado_asignaciones WHERE id_proyecto=$id");
+            $this->db->exec("DELETE FROM observaciones WHERE id_proyecto=$id");
+            $this->db->exec("DELETE FROM dictamenes WHERE id_proyecto=$id");
+            $this->db->exec("DELETE FROM documentos WHERE id_proyecto=$id");
+            $this->db->exec("DELETE FROM historial_movimientos WHERE id_proyecto=$id");
+            $this->db->exec("DELETE FROM proyectos WHERE id=$id");
+            header('Location: ' . URL_BASE . 'admin/proyectos?msg=deleted');
+        }
+    }
+    public function archivar_proyecto()
+    {
+        if (isset($_GET['id']) && isset($_GET['motivo'])) {
+            $id = $_GET['id'];
+            $motivo = $_GET['motivo'];
+            $this->db->prepare("UPDATE proyectos SET estado='Archivado' WHERE id=?")->execute([$id]);
+            $this->db->prepare("INSERT INTO historial_movimientos (id_proyecto, id_usuario, accion, detalle) VALUES (?, ?, 'ARCHIVADO', ?)")->execute([$id, $_SESSION['user_id'], "Motivo: $motivo"]);
+            header('Location: ' . URL_BASE . 'admin/proyectos?msg=archived');
+        }
+    }
+    public function programar_sustentacion()
+    {
+        if ($_POST) {
+            $this->db->prepare("UPDATE proyectos SET fecha_sustentacion=?,hora_sustentacion=?,lugar_sustentacion=?,url_sustentacion=?,estado='En Sustentación',id_etapa_actual=3 WHERE id=?")->execute([$_POST['fecha'], $_POST['hora'], $_POST['lugar'], $_POST['url'], $_POST['id_proyecto']]);
+            header('Location: ' . URL_BASE . 'admin/ver_proyecto?id=' . $_POST['id_proyecto']);
+        }
+    }
+    public function sustentaciones()
+    {
+        $this->view('admin/sustentaciones/index', ['ui' => $this->getUiData()]);
+    }
+
+
+
+
+    public function imprimir_constancia()
+    {
+        $id = (int) ($_GET["id"] ?? 0);
+        if (!$id) {
+            header("Location: " . URL_BASE . "admin/docentes");
+            exit;
+        }
+
+        $docente = $this->db->query("SELECT u.*, f.nombre as nombre_facultad FROM usuarios u LEFT JOIN facultades f ON u.id_facultad = f.id WHERE u.id=$id")->fetch(PDO::FETCH_ASSOC);
+        if (!$docente)
+            die("Docente no encontrado.");
+
+        $cvd = $_GET["cvd"] ?? "";
+        if (empty($cvd)) {
+            $stmtCvd = $this->db->prepare("SELECT cvd FROM constancias_emitidas WHERE id_usuario = ? LIMIT 1");
+            $stmtCvd->execute([$id]);
+            $cvd = $stmtCvd->fetchColumn();
+
+            if (!$cvd) {
+                $cvd = strtoupper(substr(md5(uniqid("CONST_", true) . microtime()), 0, 16));
+                $this->db->prepare("INSERT INTO constancias_emitidas (id_usuario, cvd, fecha_emision) VALUES (?, ?, NOW())")->execute([$id, $cvd]);
+            }
+        }
+        $docente["cvd"] = $cvd;
+
+        // SQL JURADO (Con id_tesista_2)
+        $sqlJ = "SELECT p.titulo, p.estado, p.created_at as fecha_presentacion, ja.rol_jurado, 
+                 u.nombres as tesista_nom, u.apellidos as tesista_ape, u.email as tesista_email, u.telefono as tesista_cel,
+                 c.nombres as cotesista_nom, c.apellidos as cotesista_ape, c.email as cotesista_email, c.telefono as cotesista_cel
+                 FROM jurado_asignaciones ja 
+                 JOIN proyectos p ON ja.id_proyecto=p.id 
+                 LEFT JOIN usuarios u ON p.id_tesista=u.id 
+                 LEFT JOIN usuarios c ON p.id_tesista_2=c.id
+                 WHERE ja.id_jurado=$id ORDER BY p.created_at DESC";
+        $jurado = $this->db->query($sqlJ)->fetchAll(PDO::FETCH_ASSOC);
+
+        // SQL ASESOR (Con id_tesista_2)
+        $sqlA = "SELECT p.titulo, p.estado, p.created_at as fecha_presentacion, 'Asesor' as rol_jurado, 
+                 u.nombres as tesista_nom, u.apellidos as tesista_ape, u.email as tesista_email, u.telefono as tesista_cel,
+                 c.nombres as cotesista_nom, c.apellidos as cotesista_ape, c.email as cotesista_email, c.telefono as cotesista_cel
+                 FROM proyectos p 
+                 LEFT JOIN usuarios u ON p.id_tesista=u.id 
+                 LEFT JOIN usuarios c ON p.id_tesista_2=c.id
+                 WHERE p.id_asesor=$id ORDER BY p.created_at DESC";
+        $asesor = $this->db->query($sqlA)->fetchAll(PDO::FETCH_ASSOC);
+
+        $protocol = (isset($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] === "on") ? "https" : "http";
+        $docente["url_verificacion"] = $protocol . "://" . $_SERVER["HTTP_HOST"] . "/sespecialidad/nadia/gemini/public/verificacion/constancia?id=$id&cvd=$cvd";
+
+        $this->view("admin/docentes/constancia_imprimir", [
+            "docente" => $docente,
+            "proyectos" => array_merge($jurado, $asesor),
+            "cvd_verificado" => true
+        ]);
+    }
+
+
+
+    public function archivos_proyecto()
+    {
+        $id = (int) ($_GET["id"] ?? 0);
+        if (!$id)
+            die("ID Incorrecto");
+        $p = $this->db->query("SELECT * FROM proyectos WHERE id=$id")->fetch(PDO::FETCH_ASSOC);
+        $docs = $this->db->query("SELECT * FROM documentos WHERE id_proyecto=$id")->fetchAll(PDO::FETCH_ASSOC);
+        $docsByType = [];
+        foreach ($docs as $d)
+            $docsByType[$d["tipo_documento"]] = $d;
+        $this->view("admin/proyectos/archivos", ["proyecto" => $p, "docsByType" => $docsByType]);
+    }
+
+    public function subir_archivo_admin()
+    {
+        if ($_POST) {
+            $pid = $_POST["id_proyecto"];
+            $tipo = $_POST["tipo_documento"];
+            $motivo = $_POST["motivo"];
+            $ext = pathinfo($_FILES["archivo"]["name"], PATHINFO_EXTENSION);
+            $n = time() . "_" . bin2hex(random_bytes(4)) . "." . $ext;
+            if (move_uploaded_file($_FILES["archivo"]["tmp_name"], "../public/uploads/tesis/" . $n)) {
+                $this->db->prepare("INSERT INTO documentos (id_proyecto, id_usuario_sube, tipo_documento, nombre_archivo_original, ruta_archivo, mime_type) VALUES (?, ?, ?, ?, ?, ?)")
+                    ->execute([$pid, $_SESSION["user_id"], $tipo, $_FILES["archivo"]["name"], "uploads/tesis/" . $n, $_FILES["archivo"]["type"]]);
+                $this->db->prepare("INSERT INTO historial_movimientos (id_proyecto, id_usuario, accion, detalle) VALUES (?, ?, \"CARGA\", ?)")
+                    ->execute([$pid, $_SESSION["user_id"], "[$tipo] Cargado por Administrador. Motivo: $motivo"]);
+                header("Location: " . URL_BASE . "admin/archivos_proyecto?id=$pid&msg=ok");
+            }
+        }
+    }
+
+    public function reemplazar_archivo_admin()
+    {
+        if ($_POST) {
+            $did = $_POST["id_documento"];
+            $pid = $_POST["id_proyecto"];
+            $motivo = $_POST["motivo"];
+            $ext = pathinfo($_FILES["archivo"]["name"], PATHINFO_EXTENSION);
+            $n = time() . "_" . bin2hex(random_bytes(4)) . "." . $ext;
+            if (move_uploaded_file($_FILES["archivo"]["tmp_name"], "../public/uploads/tesis/" . $n)) {
+                $tipo = $this->db->query("SELECT tipo_documento FROM documentos WHERE id=$did")->fetchColumn();
+                $this->db->prepare("UPDATE documentos SET nombre_archivo_original=?, ruta_archivo=?, mime_type=?, created_at=NOW() WHERE id=?")->execute([$_FILES["archivo"]["name"], "uploads/tesis/" . $n, $_FILES["archivo"]["type"], $did]);
+                $this->db->prepare("INSERT INTO historial_movimientos (id_proyecto, id_usuario, accion, detalle) VALUES (?, ?, \"REEMPLAZO\", ?)")
+                    ->execute([$pid, $_SESSION["user_id"], "[$tipo] Reemplazado por Administrador. Motivo: $motivo"]);
+                header("Location: " . URL_BASE . "admin/archivos_proyecto?id=$pid&msg=ok");
+            }
+        }
+    }
+
+    public function eliminar_archivo_admin()
+    {
+        $id = $_GET["id"];
+        $pid = $_GET["pid"];
+        $motivo = $_GET["motivo"];
+        $tipo = $this->db->query("SELECT tipo_documento FROM documentos WHERE id=$id")->fetchColumn();
+        $this->db->prepare("DELETE FROM documentos WHERE id=?")->execute([$id]);
+        $this->db->prepare("INSERT INTO historial_movimientos (id_proyecto, id_usuario, accion, detalle) VALUES (?, ?, \"ELIMINACION\", ?)")
+            ->execute([$pid, $_SESSION["user_id"], "[$tipo] Borrado por Administrador. Motivo: $motivo"]);
+        header("Location: " . URL_BASE . "admin/archivos_proyecto?id=$pid&msg=deleted");
+    }
+
+    public function autorizar_borrador()
+    {
+        $id = $_GET['id'];
+        $this->db->prepare("UPDATE proyectos SET autorizado_borrador=1 WHERE id=?")->execute([$id]);
+        $this->db->prepare("INSERT INTO historial_movimientos (id_proyecto, id_usuario, accion, detalle) VALUES (?, ?, 'AUTORIZACIÓN', 'Se autorizó la subida del borrador de tesis')")->execute([$id, $_SESSION['user_id']]);
+        header('Location: ' . URL_BASE . 'admin/ver_proyecto?id=' . $id . '&msg=authorized');
+        exit;
+    }
+
+}
