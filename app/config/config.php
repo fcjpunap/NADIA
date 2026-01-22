@@ -1,8 +1,8 @@
 <?php
-// Configuración de Base de Datos (Credenciales dedicadas)
+// Configuración de Base de Datos (CAMBIAR ESTAS CREDENCIALES EN PRODUCCIÓN)
 define('DB_HOST', 'localhost');
-define('DB_USER', 'nadia_user');      // Usuario nuevo
-define('DB_PASS', 'Nadia_2024_Secure!'); // Contraseña nueva
+define('DB_USER', 'tu_usuario_db');      // Cambiar por tu usuario de MySQL
+define('DB_PASS', 'tu_password_db');     // Cambiar por tu contraseña de MySQL
 define('DB_NAME', 'nadia');
 
 // Rutas del Sistema
