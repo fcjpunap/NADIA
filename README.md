@@ -66,6 +66,13 @@ chmod -R 755 public/
 chmod -R 777 public/uploads/
 ```
 
+### 5. Acceso al Sistema (Administrador)
+Una vez instalado, puedes acceder con las siguientes credenciales predeterminadas:
+- **Usuario:** `admin@miunap.pe`
+- **Contraseña:** `123456`
+
+> **Nota:** Por seguridad, el sistema no permite la creación directa de nuevos usuarios con rol de administrador desde la interfaz. Esta cuenta inicial debe ser protegida o gestionada directamente en la base de datos si se requiere un cambio mayor.
+
 ### ⚙️ Configuración del Servidor Apache (Importante)
 El sistema utiliza URLs amigables (ej: `/auth/login`) que requieren la reescritura de URLs en Apache.
 1. Habilitar el módulo rewrite: `sudo a2enmod rewrite`
